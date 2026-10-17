@@ -1,3 +1,4 @@
+10.5281/zenodo.23433610
 # Swarm Veto — Computational Validation
 
 Computational validation of the cross-node coincidence veto defined in the
