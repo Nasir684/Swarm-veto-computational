@@ -1,0 +1,339 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Swarm Veto \u2014 Computational Validation (Run-All Reproducible)",
+    "",
+    "**Companion to:** *Swarm Veto Protocol v1.0* (pre-registered, DOI on archive) \u2014 this notebook",
+    "implements the locked veto exactly as specified there and measures falsifiers S1\u2013S5 on",
+    "synthetic event-level data.",
+    "",
+    "**Status:** computational study, engineering analogue, control-only. Physical falsifiers",
+    "remain the pre-registered S1\u2013S5 of the protocol; this notebook does not substitute for them.",
+    "",
+    "**How to use:** Run All. Seed 684 regenerates every number and figure exactly.",
+    "Outputs: `results.json`, `fig1_suppression.png`, `fig2_survival.png`.",
+    ""
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import numpy as np, json",
+    "from scipy import stats",
+    "import matplotlib.pyplot as plt",
+    "",
+    "SEED = 684",
+    "TAU = 0.05          # s, hardware-verified hold-off (QCID-Sigma v5.4)",
+    "DT  = 0.005         # s, primary coincidence window",
+    "N   = 4             # nodes",
+    "T   = 7200.0        # s per setting",
+    "R_B = 1.0/60        # ambient genuine rate per node (1/min)",
+    "JIT = 0.001         # swarm-global jitter sigma (1 ms)",
+    "",
+    "def genuine(rng, rate, T, tag='g'):",
+    "    n = rng.poisson(rate*T)",
+    "    return np.sort(rng.uniform(0, T, n)), np.full(n, tag, dtype='<U1')",
+    "",
+    "def emi_global(rng, burst_rate, T, N, jit, p_pass):",
+    "    nb = rng.poisson(burst_rate*T)",
+    "    bt = np.sort(rng.uniform(0, T, nb))",
+    "    out = []",
+    "    for i in range(N):",
+    "        ev = bt + rng.normal(0, jit, nb)",
+    "        keep = rng.random(nb) < p_pass",
+    "        m = np.where(keep)[0].size",
+    "        out.append((np.sort(ev[keep]), np.full(m, 'e', dtype='<U1')))",
+    "    return out",
+    "",
+    "def emi_single(rng, burst_rate, T, jit, p_pass, N):",
+    "    nb = rng.poisson(burst_rate*T)",
+    "    ev = np.sort(rng.uniform(0, T, nb) + rng.normal(0, jit, nb))",
+    "    keep = rng.random(nb) < p_pass",
+    "    m = keep.sum()",
+    "    return [(np.sort(ev[keep]), np.full(m, 'e', dtype='<U1'))] + \\",
+    "           [(np.array([]), np.array([], dtype='<U1'))]*(N-1)",
+    "",
+    "def correlated(rng, rate, T, N, jit):",
+    "    \"\"\"Genuine but temporally correlated across nodes (burst-like emission).\"\"\"",
+    "    n = rng.poisson(rate*T)",
+    "    bt = np.sort(rng.uniform(0, T, n))",
+    "    return [(np.sort(bt + rng.normal(0, jit, n)), np.full(n, 'g', dtype='<U1')) for _ in range(N)]",
+    "",
+    "def deadtime(ev, tau=TAU):",
+    "    t, g = ev",
+    "    if len(t) == 0: return ev",
+    "    keep = np.ones(len(t), bool); last = t[0]",
+    "    for k in range(1, len(t)):",
+    "        if t[k]-last < tau: keep[k] = False",
+    "        else: last = t[k]",
+    "    return t[keep], g[keep]",
+    "",
+    "def veto(nodes, dt=DT):",
+    "    times = np.concatenate([n[0] for n in nodes])",
+    "    tags  = np.concatenate([n[1] for n in nodes])",
+    "    ids   = np.concatenate([np.full(len(n[0]), i) for i, n in enumerate(nodes)])",
+    "    o = np.argsort(times, kind='stable')",
+    "    times, tags, ids = times[o], tags[o], ids[o]",
+    "    acc = [[] for _ in nodes]; vet = [[] for _ in nodes]",
+    "    n = len(times); i = 0",
+    "    while i < n:",
+    "        j = i",
+    "        while j+1 < n and times[j+1]-times[i] <= dt: j += 1",
+    "        multi = len(set(ids[i:j+1])) >= 2",
+    "        for k in range(i, j+1):",
+    "            (vet if multi else acc)[ids[k]].append((times[k], tags[k]))",
+    "        i = j+1",
+    "    pack = lambda L: [(np.array([x[0] for x in n]), np.array([x[1] for x in n])) for n in L]",
+    "    return pack(acc), pack(vet)",
+    "",
+    "def run_arm(rng, genuine_rates, emi=None, dt=DT):",
+    "    \"\"\"emi: None | ('global', burst_rate, p_pass) | ('single', burst_rate, p_pass)\"\"\"",
+    "    streams = [deadtime(genuine(rng, r, T)) for r in genuine_rates]",
+    "    if emi is not None:",
+    "        kind, br, pp = emi",
+    "        e = emi_global(rng, br, T, N, JIT, pp) if kind == 'global' else emi_single(rng, br, T, JIT, pp, N)",
+    "        fixed_streams = []",
+    "        for i, s in enumerate(streams):",
+    "            tt = np.concatenate([s[0], e[i][0]]); gg = np.concatenate([s[1], e[i][1]])",
+    "            o = np.argsort(tt, kind='stable')",
+    "            fixed_streams.append(deadtime((tt[o], gg[o])))",
+    "        streams = fixed_streams",
+    "    acc, vet = veto(streams, dt)",
+    "    return dict(streams=streams, acc=acc, vet=vet)",
+    "",
+    "def count(node_list, tag):",
+    "    return sum(int(np.sum(n[1] == tag)) for n in node_list)",
+    "",
+    "R = {'meta': dict(seed=SEED, N=N, T_s=T, tau_s=TAU, dt_s=DT, jitter_s=JIT, ambient_per_min=R_B*60)}",
+    ""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Simulator core \u2014 event-level generators, dead time, and the locked veto",
+    "Genuine events: exact Poisson processes per node. Swarm-global EMI: simultaneous bursts across all nodes within jitter \u03c3 = 1 ms, thinned by the per-node gate pass probability. Dead time \u03c4 = 0.05 s and veto window \u0394t = 5 ms are the hardware-verified, locked values."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "R['deadtime_check'] = {}",
+    "for r in [1.2, 10, 50]:",
+    "    rps = r/60",
+    "    R['deadtime_check'][r] = round((rps - rps/(1+rps*TAU))/rps*100, 2)",
+    ""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Sanity check \u2014 dead-time distortion vs QCID-Sigma v5.4 verified values",
+    "The simulator must reproduce the hardware-verified distortion (0.10 / 0.83 / 4.00% at 1.2 / 10 / 50 min\u207b\u00b9) before any veto result is trusted."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "R['S1'] = {}",
+    "for pp in [0.25, 0.5, 0.6, 0.75, 0.9]:",
+    "    row = {}",
+    "    for dt in [0.002, 0.005, 0.010]:",
+    "        a = run_arm(rng, [R_B]*N, ('global', 30/60, pp), dt)",
+    "        e_pre, e_acc = count(a['streams'], 'e'), count(a['acc'], 'e')",
+    "        row[f'dt{int(dt*1000)}'] = dict(e_pre=e_pre, e_acc=e_acc,",
+    "                                        suppression=e_pre/max(e_acc, 1))",
+    "    R['S1'][f'p{pp}'] = row",
+    ""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## S1 \u2014 suppression vs interference strength and window"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "R['G1'] = {}",
+    "for r_s in [5/60, 10/60, 20/60, 50/60]:",
+    "    a = run_arm(rng, [R_B + r_s] + [R_B]*(N-1), ('global', 30/60, 0.9))",
+    "    g_pre, g_acc = count(a['streams'], 'g'), count(a['acc'], 'g')",
+    "    R['G1'][int(r_s*60)] = dict(g_pre=g_pre, g_acc=g_acc, survival=g_acc/max(g_pre, 1))",
+    ""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## S2 / G1 \u2014 node-local source survival with swarm-global injection on"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "R['G2'] = {}",
+    "for r_s in [5/60, 10/60, 20/60, 50/60]:",
+    "    a = run_arm(rng, [R_B + r_s]*N)",
+    "    g_pre, g_acc = count(a['streams'], 'g'), count(a['acc'], 'g')",
+    "    c = [deadtime(e) for e in correlated(rng, R_B + r_s, T, N, JIT)]",
+    "    acc_c, _ = veto(c)",
+    "    g_pre_c = sum(len(x[0]) for x in c); g_acc_c = count(acc_c, 'g')",
+    "    R['G2'][int(r_s*60)] = dict(equi_survival=g_acc/max(g_pre, 1),",
+    "                                corr_survival=g_acc_c/max(g_pre_c, 1),",
+    "                                corr_pre=g_pre_c)",
+    ""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## S2 / G2 \u2014 equidistant geometry: independent Poisson vs correlated emission",
+    "The protocol's declared worst case. Two emission models are tested because the geometry alone does not determine the outcome \u2014 the emission statistics do."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "R['C2'] = {}",
+    "for pp in [0.6, 0.9]:",
+    "    a = run_arm(rng, [R_B]*N, ('single', 30/60, pp))",
+    "    e_pre0 = count([a['streams'][0]], 'e'); e_acc0 = count([a['acc'][0]], 'e')",
+    "    R['C2'][f'p{pp}'] = dict(e_pre0=e_pre0, e_acc0=e_acc0, survival=e_acc0/max(e_pre0, 1))",
+    ""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## C2 \u2014 single-node injection must survive the veto"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "a = run_arm(rng, [R_B + 10/60]*N)",
+    "R['KS'] = []",
+    "for i in range(N):",
+    "    x = np.diff(a['acc'][i][0])",
+    "    D, p = stats.kstest(x, 'expon', args=(0, x.mean()))",
+    "    R['KS'].append(dict(node=i, D=float(D), p=float(p), n_intervals=int(len(x))))",
+    ""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## S3 \u2014 per-node Poisson preservation (KS) on accepted streams"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "verd = {}",
+    "for dt in [2, 5, 10]:",
+    "    s1 = R['S1']['p0.9'][f'dt{dt}']['suppression']",
+    "    g2 = R['G2'][10]",
+    "    verd[f'dt{dt}'] = dict(S1_pass=bool(s1 >= 10), S2_equi_pass=bool(g2['equi_survival'] >= 0.85))",
+    "R['S5_verdicts'] = verd",
+    "",
+    "with open('/mnt/agents/output/results.json', 'w') as f:",
+    "    json.dump(R, f, indent=1)",
+    ""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## S5 \u2014 verdicts across \u0394t = 2, 5, 10 ms"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "fig, ax = plt.subplots(figsize=(7, 4.2))",
+    "pps = [0.25, 0.5, 0.6, 0.75, 0.9]",
+    "for dt, mk in [(2, 'o'), (5, 's'), (10, '^')]:",
+    "    sup = [R['S1'][f'p{p}'][f'dt{dt}']['suppression'] for p in pps]",
+    "    ax.plot([p*100 for p in pps], sup, mk+'-', label=f'\u0394t = {dt} ms')",
+    "ax.set_yscale('log'); ax.axhline(10, color='k', ls='--', lw=1, label='S1 threshold (10\u00d7)')",
+    "ax.set_xlabel('EMI per-node gate pass probability (%)'); ax.set_ylabel('Suppression factor (log)')",
+    "ax.set_title('S1: EMI suppression vs interference strength (N = 4, seed 684)')",
+    "ax.legend(); fig.tight_layout()",
+    "fig.savefig('/mnt/agents/output/fig1_suppression.png', dpi=150)",
+    "",
+    "fig, axes = plt.subplots(1, 3, figsize=(12, 3.8))",
+    "rates = [5, 10, 20, 50]",
+    "axes[0].plot(rates, [R['G1'][r]['survival']*100 for r in rates], 'o-', color='C2')",
+    "axes[0].axhline(85, color='k', ls='--', lw=1); axes[0].set_title('G1 node-local survival (inj. on)')",
+    "axes[1].plot(rates, [R['G2'][r]['equi_survival']*100 for r in rates], 'o-', color='C0')",
+    "axes[1].plot(rates, [R['G2'][r]['corr_survival']*100 for r in rates], 's--', color='C3')",
+    "axes[1].set_yscale('log'); axes[1].axhline(10, color='k', ls=':', lw=1)",
+    "axes[1].set_title('G2 equidistant: Poisson vs correlated')",
+    "axes[2].bar(['p=0.6','p=0.9'], [R['C2']['p0.6']['survival']*100, R['C2']['p0.9']['survival']*100], color='C4')",
+    "axes[2].set_ylim(0, 105); axes[2].set_title('C2 single-node injection survival (%)')",
+    "for ax in axes: ax.set_xlabel('source rate (min$^{-1}$)') if ax is not axes[2] else None",
+    "fig.tight_layout(); fig.savefig('/mnt/agents/output/fig2_survival.png', dpi=150)",
+    "print(\"SIMULATION COMPLETE\")",
+    "print(json.dumps({k: R[k] for k in ['deadtime_check','S5_verdicts','KS']}, indent=1))",
+    "print(\"S1 suppression (p=0.9):\", {d: round(R['S1']['p0.9'][d]['suppression'],1) for d in R['S1']['p0.9']})",
+    "print(\"G1 survival:\", {r: round(R['G1'][r]['survival']*100,1) for r in R['G1']})",
+    "print(\"G2 equi:\", {r: round(R['G2'][r]['equi_survival']*100,1) for r in R['G2']},",
+    "      \"| G2 corr:\", {r: f\"{R['G2'][r]['corr_survival']*100:.2f}%\" for r in R['G2']})",
+    "print(\"C2:\", {k: round(v['survival']*100,1) for k,v in R['C2'].items()})"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.12"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
